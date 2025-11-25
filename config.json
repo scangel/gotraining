@@ -1,0 +1,21 @@
+{
+  "server": {
+    "address": ":8080"
+  },
+  "data_dir": "data",
+  "tls": {
+    "enabled": false,
+    "cert_file": "",
+    "key_file": ""
+  },
+  "redis": {
+    "host": "localhost",
+    "port": "6379",
+    "password": "",
+    "db": 0
+  },
+  "security": {
+    "jwt_secret": "change-this-to-a-secure-secret",
+    "user_store_key": "change-this-to-a-secure-passphrase"
+  }
+}

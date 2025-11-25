@@ -20,10 +20,12 @@ func getTestConfig(t *testing.T) *Config {
 	c.Server.Address = ":8080"
 	c.DataDir = tmpDir
 	c.Security.JWTSecret = "test-secret"
-	c.Security.UserStoreKey = "test-key-must-be-32-bytes-long-!!" // AES-256 needs 32 bytes usually, or at least consistent
+	c.Security.UserStoreKey = "test-key-must-be-32-bytes-long-!!"
 	c.TLS.Enabled = false
-	// We need to pass tmpDir to the server somehow.
-	// Let's add DataDir to Config struct first.
+	c.Redis.Host = "localhost"
+	c.Redis.Port = "6379"
+	c.Redis.Password = ""
+	c.Redis.DB = 0
 	return c
 }
 

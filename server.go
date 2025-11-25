@@ -16,7 +16,7 @@ type Server struct {
 	authService  *AuthService
 	sessionStore *SessionStore
 }
-ㅜ
+
 func NewServer(config *Config) (*Server, error) {
 	userStore, err := NewUserStore(config.Security.UserStoreKey, config.DataDir)
 	if err != nil {
