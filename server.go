@@ -1,67 +1,117 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net/http"
-	"os"
+	"time"
 )
 
 type Server struct {
-	addr string
+	config       *Config
+	mux          *http.ServeMux
+	shutdownCh   chan struct{}
+	userStore    *UserStore
+	authService  *AuthService
+	sessionStore *SessionStore
+}
+ㅜ
+func NewServer(config *Config) (*Server, error) {
+	userStore, err := NewUserStore(config.Security.UserStoreKey, config.DataDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create user store: %w", err)
+	}
+
+	authService := NewAuthService(userStore, config.Security.JWTSecret)
+
+	sessionStore, err := NewSessionStore(config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create session store: %w", err)
+	}
+
+	s := &Server{
+		config:       config,
+		mux:          http.NewServeMux(),
+		shutdownCh:   make(chan struct{}),
+		userStore:    userStore,
+		authService:  authService,
+		sessionStore: sessionStore,
+	}
+	s.routes()
+	return s, nil
 }
 
-func NewServer(addr string) *Server {
-	return &Server{
-		addr: addr,
+func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		log.Printf("%s %s", r.Method, r.URL.Path)
+		next.ServeHTTP(w, r)
+		log.Printf("Completed in %v", time.Since(start))
+	})
+}
+
+// sessionMiddleware validates the session cookie and adds user ID to request context
+func (s *Server) sessionMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		cookie, err := r.Cookie("session_id")
+		if err != nil {
+			http.Error(w, "Unauthorized: no session", http.StatusUnauthorized)
+			return
+		}
+
+		userID, err := s.sessionStore.GetSession(cookie.Value)
+		if err != nil {
+			http.Error(w, "Unauthorized: invalid session", http.StatusUnauthorized)
+			return
+		}
+
+		// Refresh session on each request
+		s.sessionStore.RefreshSession(cookie.Value, 0)
+
+		// Add user ID to request context
+		ctx := context.WithValue(r.Context(), "userID", userID)
+		next.ServeHTTP(w, r.WithContext(ctx))
 	}
 }
 
 func (s *Server) Start() error {
-	mux := http.NewServeMux()
-
-	mux.HandleFunc("/", s.handleHome)
-	mux.HandleFunc("/hello", s.handleHello)
-	mux.HandleFunc("/health", s.handleHealth)
-	mux.HandleFunc("/EndCmd", s.handleEndCmd)
-
-	log.Printf("Starting server on %s", s.addr)
-	return http.ListenAndServe(s.addr, mux)
-}
-
-func (s *Server) handleHome(w http.ResponseWriter, r *http.Request) {
-	log.Printf("%s %s", r.Method, r.URL.Path)
-	fmt.Fprintf(w, "Welcome to Go HTTP Server!\n")
-}
-
-func (s *Server) handleHello(w http.ResponseWriter, r *http.Request) {
-	log.Printf("%s %s", r.Method, r.URL.Path)
-	name := r.URL.Query().Get("name")
-	if name == "" {
-		name = "World"
+	srv := &http.Server{
+		Addr:    s.config.Server.Address,
+		Handler: s.loggingMiddleware(s.mux),
 	}
 
-	fmt.Fprintf(w, "Hello, %s!\n", name)
-}
+	// Channel to listen for server errors
+	serverErrors := make(chan error, 1)
 
-func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	log.Printf("%s %s", r.Method, r.URL.Path)
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, "OK\n")
-}
+	// Start server
+	go func() {
+		if s.config.TLS.Enabled {
+			log.Printf("Starting secure server (HTTPS) on %s", s.config.Server.Address)
+			serverErrors <- srv.ListenAndServeTLS(s.config.TLS.CertFile, s.config.TLS.KeyFile)
+		} else {
+			log.Printf("Starting server (HTTP) on %s", s.config.Server.Address)
+			serverErrors <- srv.ListenAndServe()
+		}
+	}()
 
-func (s *Server) handleEndCmd(w http.ResponseWriter, r *http.Request) {
-	log.Printf("%s %s", r.Method, r.URL.Path)
+	// Blocking wait for shutdown signal or server error
+	select {
+	case err := <-serverErrors:
+		return fmt.Errorf("server error: %w", err)
+	case <-s.shutdownCh:
+		log.Println("Shutdown signal received")
 
-	if r.URL.Query().Has("darkangel") {
-		log.Println("Shutdown command received: /EndCmd?darkangel detected")
-		log.Println("Shutting down server...")
-		fmt.Fprintf(w, "Server is shutting down...\n")
-		go func() {
-			os.Exit(0)
-		}()
-		return
+		// Create a context with timeout for graceful shutdown
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		if err := srv.Shutdown(ctx); err != nil {
+			// Force close if graceful shutdown fails
+			srv.Close()
+			return fmt.Errorf("could not stop server gracefully: %w", err)
+		}
+		log.Println("Server stopped gracefully")
+		return nil
 	}
-
-	fmt.Fprintf(w, "EndCmd endpoint - use ?darkangel to shutdown\n")
 }
