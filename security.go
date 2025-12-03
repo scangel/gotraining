@@ -372,14 +372,10 @@ func (s *Server) csrfMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		// Get token from header or form
+		// Get token from header only (form value parsing would consume the body)
 		requestToken := r.Header.Get(csrfHeaderName)
 		if requestToken == "" {
-			requestToken = r.FormValue(csrfFormField)
-		}
-
-		if requestToken == "" {
-			http.Error(w, "CSRF token not provided", http.StatusForbidden)
+			http.Error(w, "CSRF token not provided in header", http.StatusForbidden)
 			return
 		}
 
