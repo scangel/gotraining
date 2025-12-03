@@ -398,11 +398,26 @@
         const errorMessage = document.getElementById('errorMessage');
         const loginButton = loginForm.querySelector('.btn-login');
 
+        // CSRF 토큰을 쿠키에서 읽는 함수
+        function getCSRFToken() {
+            const name = 'csrf_token=';
+            const decodedCookie = decodeURIComponent(document.cookie);
+            const cookies = decodedCookie.split(';');
+            for (let cookie of cookies) {
+                cookie = cookie.trim();
+                if (cookie.indexOf(name) === 0) {
+                    return cookie.substring(name.length);
+                }
+            }
+            return '';
+        }
+
         loginForm.addEventListener('submit', async (e) => {
             e.preventDefault();
-            
+
             const username = document.getElementById('username').value;
             const password = document.getElementById('password').value;
+            const csrfToken = getCSRFToken();
 
             // Show loading state
             loginButton.classList.add('loading');
@@ -413,6 +428,7 @@
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/x-www-form-urlencoded',
+                        'X-CSRF-Token': csrfToken,
                     },
                     body: new URLSearchParams({
                         grant_type: 'password',
@@ -427,12 +443,12 @@
                 if (response.ok) {
                     // Store token
                     localStorage.setItem('access_token', data.access_token);
-                    
+
                     // Redirect to dashboard or callback URL
-                    const redirectUrl = new URLSearchParams(window.location.search).get('redirect_uri') || '/dashboard';
+                    const redirectUrl = new URLSearchParams(window.location.search).get('redirect_uri') || '/';
                     window.location.href = redirectUrl;
                 } else {
-                    throw new Error(data.error_description || 'Login failed');
+                    throw new Error(data.error_description || data.message || 'Login failed');
                 }
             } catch (error) {
                 errorMessage.textContent = error.message;

@@ -3,8 +3,11 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"html"
 	"log"
 	"net/http"
+	"net/mail"
+	"regexp"
 	"time"
 )
 
@@ -22,7 +25,19 @@ const (
 	pathToken     = "/oauth/token"
 	pathUserInfo  = "/oauth/userinfo"
 	pathRegister  = "/oauth/register"
-	pathAuthorize = "/oauth/authorize"
+	pathAuthorize        = "/oauth/authorize"
+	pathRegisterPage     = "/register"
+
+	// Redis Monitor paths
+	pathRedisMonitor = "/redis"
+	pathRedisInfo    = "/api/redis/info"
+	pathRedisKeys    = "/api/redis/keys"
+	pathRedisKey     = "/api/redis/key"
+	pathRedisPing    = "/api/redis/ping"
+	pathRedisStats   = "/api/redis/stats"
+
+	// Game paths
+	pathTetris = "/tetris"
 )
 
 func (s *Server) routes() {
@@ -43,11 +58,27 @@ func (s *Server) routes() {
 	s.mux.HandleFunc(pathToken, s.handleToken)
 	s.mux.HandleFunc(pathUserInfo, s.handleUserInfo)
 	s.mux.HandleFunc(pathRegister, s.handleRegister)
+	s.mux.HandleFunc(pathRegisterPage, s.handleRegisterPage)
 	s.mux.HandleFunc(pathAuthorize, s.handleAuthorize)
+
+	// Redis Monitor routes
+	s.mux.HandleFunc(pathRedisMonitor, s.handleRedisMonitor)
+	s.mux.HandleFunc(pathRedisInfo, s.handleRedisInfo)
+	s.mux.HandleFunc(pathRedisKeys, s.handleRedisKeys)
+	s.mux.HandleFunc(pathRedisKey, s.handleRedisKeyValue)
+	s.mux.HandleFunc(pathRedisPing, s.handleRedisPing)
+	s.mux.HandleFunc(pathRedisStats, s.handleRedisStats)
+
+	// Game routes
+	s.mux.HandleFunc(pathTetris, s.handleTetris)
 }
 
 func (s *Server) handleHome(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintf(w, "Welcome to Go HTTP Server!\n")
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	http.ServeFile(w, r, "./static/index.html")
 }
 
 func (s *Server) handleHello(w http.ResponseWriter, r *http.Request) {
@@ -55,7 +86,8 @@ func (s *Server) handleHello(w http.ResponseWriter, r *http.Request) {
 	if name == "" {
 		name = defaultName
 	}
-	fmt.Fprintf(w, "Hello, %s!\n", name)
+	// XSS 방지: HTML 이스케이프 적용
+	fmt.Fprintf(w, "Hello, %s!\n", html.EscapeString(name))
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -149,28 +181,49 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 브루트포스 방어: 로그인 시도 횟수 확인
+	blocked, remaining, err := s.loginTracker.IsBlocked(username)
+	if err != nil {
+		log.Printf("Login tracker error: %v", err)
+	}
+	if blocked {
+		lockoutTime := s.loginTracker.GetLockoutTimeRemaining(username)
+		w.Header().Set("Retry-After", fmt.Sprintf("%d", lockoutTime))
+		http.Error(w, fmt.Sprintf("Too many failed login attempts. Try again in %d seconds.", lockoutTime), http.StatusTooManyRequests)
+		return
+	}
+
 	user, err := s.authService.Authenticate(username, password)
 	if err != nil {
+		// 실패한 로그인 시도 기록
+		s.loginTracker.RecordFailedAttempt(username)
+		log.Printf("Failed login attempt for user %s (remaining: %d)", username, remaining-1)
 		http.Error(w, "Invalid credentials", http.StatusUnauthorized)
 		return
 	}
 
+	// 로그인 성공 시 실패 카운터 초기화
+	s.loginTracker.ResetAttempts(username)
+
 	idToken, err := s.authService.GenerateIDToken(user)
 	if err != nil {
-		http.Error(w, "Failed to generate ID token", http.StatusInternalServerError)
+		log.Printf("Failed to generate ID token: %v", err)
+		http.Error(w, "Authentication failed", http.StatusInternalServerError)
 		return
 	}
 
 	accessToken, err := s.authService.GenerateAccessToken(user)
 	if err != nil {
-		http.Error(w, "Failed to generate access token", http.StatusInternalServerError)
+		log.Printf("Failed to generate access token: %v", err)
+		http.Error(w, "Authentication failed", http.StatusInternalServerError)
 		return
 	}
 
 	// Create session in Redis
 	sessionID, err := s.sessionStore.CreateSession(user.ID, 0)
 	if err != nil {
-		http.Error(w, "Failed to create session", http.StatusInternalServerError)
+		log.Printf("Failed to create session: %v", err)
+		http.Error(w, "Authentication failed", http.StatusInternalServerError)
 		return
 	}
 
@@ -181,8 +234,8 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 		Path:     "/",
 		MaxAge:   86400, // 24 hours
 		HttpOnly: true,
-		Secure:   false, // Set to true in production with HTTPS
-		SameSite: http.SameSiteLaxMode,
+		Secure:   s.config.TLS.Enabled, // HTTPS일 때만 Secure 설정
+		SameSite: http.SameSiteStrictMode,
 	})
 
 	response := map[string]interface{}{
@@ -227,6 +280,30 @@ func (s *Server) handleUserInfo(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
+// 입력 검증 함수들
+func validateUsername(username string) bool {
+	if len(username) < 3 || len(username) > 30 {
+		return false
+	}
+	matched, _ := regexp.MatchString(`^[a-zA-Z0-9_]+$`, username)
+	return matched
+}
+
+func validateEmail(email string) bool {
+	_, err := mail.ParseAddress(email)
+	return err == nil
+}
+
+func validatePassword(password string) bool {
+	if len(password) < 8 {
+		return false
+	}
+	// 최소 하나의 숫자와 특수문자 포함
+	hasDigit, _ := regexp.MatchString(`[0-9]`, password)
+	hasSpecial, _ := regexp.MatchString(`[!@#$%^&*(),.?":{}|<>\-_=+\[\]\\;'/~]`, password)
+	return hasDigit && hasSpecial
+}
+
 func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -244,9 +321,27 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 서버 측 입력 검증
+	if !validateUsername(req.Username) {
+		http.Error(w, "Invalid username: must be 3-30 characters (letters, numbers, underscores)", http.StatusBadRequest)
+		return
+	}
+
+	if !validateEmail(req.Email) {
+		http.Error(w, "Invalid email format", http.StatusBadRequest)
+		return
+	}
+
+	if !validatePassword(req.Password) {
+		http.Error(w, "Password must be at least 8 characters with a number and special character", http.StatusBadRequest)
+		return
+	}
+
 	user, err := s.userStore.CreateUser(req.Username, req.Email, req.Password)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		// 민감 정보 노출 방지: 일반적인 에러 메시지 반환
+		log.Printf("Registration failed for user %s: %v", req.Username, err)
+		http.Error(w, "Registration failed", http.StatusBadRequest)
 		return
 	}
 
@@ -261,6 +356,14 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
+func (s *Server) handleRegisterPage(w http.ResponseWriter, r *http.Request) {
+	http.ServeFile(w, r, "./static/register.html")
+}
+
 func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "Authorization endpoint - not fully implemented\n")
+}
+
+func (s *Server) handleTetris(w http.ResponseWriter, r *http.Request) {
+	http.ServeFile(w, r, "./static/tetris.html")
 }

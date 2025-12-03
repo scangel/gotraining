@@ -105,6 +105,11 @@ func (s *SessionStore) Close() error {
 	return s.client.Close()
 }
 
+// GetClient returns the Redis client for use by other components
+func (s *SessionStore) GetClient() *redis.Client {
+	return s.client
+}
+
 // generateSessionID generates a cryptographically secure random session ID
 func generateSessionID() (string, error) {
 	bytes := make([]byte, 32)

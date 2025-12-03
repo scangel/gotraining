@@ -15,6 +15,9 @@ type Server struct {
 	userStore    *UserStore
 	authService  *AuthService
 	sessionStore *SessionStore
+	redisMonitor *RedisMonitor
+	rateLimiter  *RateLimiter
+	loginTracker *LoginAttemptTracker
 }
 
 func NewServer(config *Config) (*Server, error) {
@@ -30,6 +33,17 @@ func NewServer(config *Config) (*Server, error) {
 		return nil, fmt.Errorf("failed to create session store: %w", err)
 	}
 
+	redisMonitor, err := NewRedisMonitor(config)
+	if err != nil {
+		log.Printf("Warning: Redis monitor initialization failed: %v", err)
+		// Continue without Redis monitor - it's not critical
+	}
+
+	// Initialize rate limiter and login tracker using session store's Redis client
+	var redisClient = sessionStore.GetClient()
+	rateLimiter := NewRateLimiter(redisClient, 100) // 100 requests per minute
+	loginTracker := NewLoginAttemptTracker(redisClient, 5, 15*time.Minute) // 5 attempts, 15 min lockout
+
 	s := &Server{
 		config:       config,
 		mux:          http.NewServeMux(),
@@ -37,6 +51,9 @@ func NewServer(config *Config) (*Server, error) {
 		userStore:    userStore,
 		authService:  authService,
 		sessionStore: sessionStore,
+		redisMonitor: redisMonitor,
+		rateLimiter:  rateLimiter,
+		loginTracker: loginTracker,
 	}
 	s.routes()
 	return s, nil
@@ -51,8 +68,38 @@ func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// securityHeadersMiddleware adds security headers to all responses
+func (s *Server) securityHeadersMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Clickjacking 방지
+		w.Header().Set("X-Frame-Options", "DENY")
+
+		// MIME 타입 스니핑 방지
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+
+		// XSS 보호 (레거시 브라우저용)
+		w.Header().Set("X-XSS-Protection", "1; mode=block")
+
+		// Content Security Policy
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none';")
+
+		// Referrer 정책
+		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+
+		// 기능 정책
+		w.Header().Set("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
+
+		// HTTPS 사용 시 HSTS 설정
+		if s.config.TLS.Enabled {
+			w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
 // sessionMiddleware validates the session cookie and adds user ID to request context
-func (s *Server) sessionMiddleware(next http.HandlerFunc) http.HandlerFunc {
+/* func (s *Server) sessionMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		cookie, err := r.Cookie("session_id")
 		if err != nil {
@@ -73,12 +120,12 @@ func (s *Server) sessionMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		ctx := context.WithValue(r.Context(), "userID", userID)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	}
-}
+} */
 
 func (s *Server) Start() error {
 	srv := &http.Server{
 		Addr:    s.config.Server.Address,
-		Handler: s.loggingMiddleware(s.mux),
+		Handler: s.securityHeadersMiddleware(s.csrfMiddleware(s.rateLimitMiddleware(s.loggingMiddleware(s.mux)))),
 	}
 
 	// Channel to listen for server errors

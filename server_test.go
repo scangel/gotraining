@@ -57,15 +57,15 @@ func TestHandleHome(t *testing.T) {
 
 	handler.ServeHTTP(rr, req)
 
+	// Home page now serves index.html, so we check for HTML content
 	if status := rr.Code; status != http.StatusOK {
 		t.Errorf("handler returned wrong status code: got %v want %v",
 			status, http.StatusOK)
 	}
 
-	expected := "Welcome to Go HTTP Server!\n"
-	if rr.Body.String() != expected {
-		t.Errorf("handler returned unexpected body: got %v want %v",
-			rr.Body.String(), expected)
+	// Check that response contains HTML content
+	if !strings.Contains(rr.Body.String(), "<!DOCTYPE html>") && !strings.Contains(rr.Body.String(), "Dark Angel") {
+		t.Errorf("handler did not return HTML content: got %v", rr.Body.String())
 	}
 }
 
