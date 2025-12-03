@@ -1,0 +1,26 @@
+# Build output
+server
+01
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Config with secrets (use config.example.json as template)
+config.json
+
+# Data files
+data/
+
+# Test coverage
+coverage.out
+*.cover
+
+# Dependency directories
+vendor/
